@@ -1,0 +1,19 @@
+{
+  "name": "react-to-next-converter",
+  "version": "1.0.0",
+  "description": "Un outil CLI pour convertir un projet React Vite en Next.js",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "bin": {
+    "reactconverter": "./index.js"
+  },
+  "dependencies": {
+    "glob": "11.0.3",
+    "image-size": "^2.0.2"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
