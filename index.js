@@ -119,6 +119,7 @@ async function updateAllImportPaths(appPath) {
 }
 
 
+// REMPLACEZ LA FONCTION transformSourceFiles EXISTANTE PAR CELLE-CI
 async function transformSourceFiles(projectPath) {
     const appPath = path.join(projectPath, 'app');
     const allFiles = await glob(`${appPath}/**/*.{ts,tsx}`);
@@ -140,7 +141,9 @@ async function transformSourceFiles(projectPath) {
         );
 
         // --- PASSE 2: NETTOYAGE COMPLET DU SYSTÈME DE PROPS "onNavigateTo..." ---
+        // A. Nettoyer les appels de composants
         content = content.replace(/\s+onNavigateTo\w+={[^}]+}/g, '');
+        // B. Nettoyer les signatures de fonction (approche par ligne)
         content = content.replace(
             /(export\s+(?:default\s+)?function\s+\w+\s*\()({[\s\S]+?})(\)\s*\{)/g,
             (match, start, propsBlock, end) => {
@@ -148,52 +151,51 @@ async function transformSourceFiles(projectPath) {
                 const lines = propsBlock.split('\n');
                 const filteredLines = lines.filter(line => !line.includes('onNavigateTo'));
                 let newPropsBlock = filteredLines.join('\n');
-                if (newPropsBlock.replace(/[{},\s\n]/g, '') === '') return `${start}${end}`;
+                if (newPropsBlock.replace(/[{},\s\n]/g, '') === '') {
+                    return `${start}${end}`;
+                }
                 return `${start}${newPropsBlock}${end}`;
             }
         );
+        // C. Nettoyer les `interface` ou `type` definitions
         content = content.replace(/^\s*onNavigateTo\w+:\s*\([\s\S]*?;\s*$/gm, '');
 
+        // --- NOUVEAU - PASSE 3: MODERNISER LES IMAGES <img> -> <Image> ---
         // --- PASSE 3: MODERNISER LES IMAGES <img> -> <Image> AVEC DIMENSIONS ---
         if (content.includes('<img')) {
             content = content.replace(/<img([\s\S]*?)\/?>/g, (match, attributes) => {
                 const hasWidth = /width\s*=\s*['"{]/.test(attributes);
                 const hasHeight = /height\s*=\s*['"{]/.test(attributes);
 
-                // Si les dimensions sont déjà là, on convertit juste la balise.
                 if (hasWidth && hasHeight) {
                     return `<Image${attributes}/>`;
                 }
 
-                const srcMatch = attributes.match(/src\s*=\s*['"]([^'"]+)['"]/);
+                const srcMatch = attributes.match(/src\s*=\s*(?:['"]([^'"]+)['"]|{([^}]+)})/);
                 if (!srcMatch) return match; // Garder l'original si pas de src
                 
-                const src = srcMatch[1];
+                const src = srcMatch[1] || srcMatch[2]; // src peut être une chaîne ou une variable
                 let dimensionsAttr = '';
 
-                // CAS 1: Image locale (commence par /)
-                if (src.startsWith('/')) {
+                if (src.startsWith('/')) { // Image locale
                     try {
                         const imagePath = path.join(projectPath, 'public', src);
                         const dimensions = sizeOf(imagePath);
                         if (!hasWidth) dimensionsAttr += ` width={${dimensions.width}}`;
                         if (!hasHeight) dimensionsAttr += ` height={${dimensions.height}}`;
                     } catch (error) {
-                        console.warn(`  [Attention] Impossible de trouver les dimensions pour l'image locale: ${src}. Utilisation de dimensions par défaut.`);
-                        if (!hasWidth) dimensionsAttr += ` width={500}`;
-                        if (!hasHeight) dimensionsAttr += ` height={500} /* TODO: Vérifier les dimensions de cette image locale */`;
+                        console.warn(`  [Attention] Impossible de trouver les dimensions pour: ${src}. Ajout de dimensions par défaut.`);
+                        if (!hasWidth) dimensionsAttr += ` width={500} /* TODO: Vérifier dimensions locales */`;
+                        if (!hasHeight) dimensionsAttr += ` height={500}`;
                     }
                 } 
-                // CAS 2: Image externe (commence par http)
-                else if (src.startsWith('http')) {
-                     if (!hasWidth) dimensionsAttr += ` width={1200}`;
-                     if (!hasHeight) dimensionsAttr += ` height={800} /* TODO: Vérifier les dimensions de cette image externe */`;
+                else if (src.startsWith('http')) { // Image externe
+                     if (!hasWidth) dimensionsAttr += ` width={1200} /* TODO: Vérifier dimensions externes */`;
+                     if (!hasHeight) dimensionsAttr += ` height={800}`;
                 }
-                // CAS 3: Image importée (ex: src={logoImage})
-                else {
-                    // C'est un cas complexe, on met des dimensions par défaut avec un avertissement
-                    if (!hasWidth) dimensionsAttr += ` width={500}`;
-                    if (!hasHeight) dimensionsAttr += ` height={500} /* TODO: Vérifier les dimensions de cette image importée */`;
+                else { // Image importée (ex: src={logoImage})
+                    if (!hasWidth) dimensionsAttr += ` width={500} /* TODO: Vérifier dimensions importées */`;
+                    if (!hasHeight) dimensionsAttr += ` height={500}`;
                 }
                 
                 return `<Image${attributes}${dimensionsAttr}/>`;
@@ -202,12 +204,15 @@ async function transformSourceFiles(projectPath) {
 
         // --- PASSE 4: FINALISATION (IMPORTS, 'use client', etc.) ---
         content = content.replace(/from 'motion\/react'/g, "from 'framer-motion'");
+        
+        // Ajout des imports nécessaires
         if (content.includes('<Link') && !content.includes("import Link from 'next/link'")) {
             content = "import Link from 'next/link';\n" + content;
         }
         if (content.includes('<Image') && !content.includes("import Image from 'next/image'")) {
             content = "import Image from 'next/image';\n" + content;
         }
+
         if (/(useState|useEffect|motion|whileInView|onClick)/.test(content) && !content.trim().startsWith("'use client'")) {
             content = "'use client';\n\n" + content;
         }
@@ -221,18 +226,90 @@ async function transformSourceFiles(projectPath) {
     }
 }
 
-// --- LOGIQUE DE ROUTAGE ET DE LAYOUT ---
 async function createNextJsLayout(appPath) {
-    const layoutContent = `
+    const appTsxPath = path.join(appPath, 'App.tsx');
+    const layoutTsxPath = path.join(appPath, 'layout.tsx');
+
+    // ÉTAPE 1: GÉRER L'ABSENCE DU FICHIER SOURCE
+    if (!await fileExists(appTsxPath)) {
+        console.warn("[Attention] 'App.tsx' non trouvé. Création d'un layout minimaliste.");
+        const fallbackLayout = `import "./globals.css";\nexport default function RootLayout({ children }) { return <html lang="en"><body>{children}</body></html>; }`;
+        await fs.writeFile(layoutTsxPath, fallbackLayout);
+        await fs.writeFile(path.join(appPath, 'globals.css'), '/* Styles globaux */');
+        return;
+    }
+
+    console.log("Conversion finale de 'App.tsx' en 'layout.tsx'...");
+    let content = await fs.readFile(appTsxPath, 'utf8');
+
+    // --- ÉTAPE 2: EXTRACTION DES BLOCS DE CODE ---
+    const allImports = (content.match(/import[\s\S]*?from\s*['"][^'"]+['"];?/g) || []);
+    const returnMatch = content.match(/return\s*\(([\s\S]*?)\);/);
+    if (!returnMatch) throw new Error("Bloc 'return' non trouvé dans App.tsx.");
+    let mainJsx = returnMatch[1];
+
+    // --- ÉTAPE 3: LA TRANSFORMATION CLÉ - ISOLER ET REMPLACER ---
+    
+    // A. Identifier tous les noms de composants de page depuis les imports
+    const pageComponentNames = [];
+    const pageImports = allImports.filter(imp => /\/pages\//.test(imp));
+    pageImports.forEach(imp => {
+        const match = imp.match(/{\s*([^}]+?)\s*}/);
+        if (match && match[1]) {
+            pageComponentNames.push(...match[1].split(',').map(name => name.trim().split(' ')[0]));
+        }
+    });
+    // On ajoute manuellement d'autres composants non-layout connus
+    pageComponentNames.push('MetaTags');
+
+    // B. Remplacer TOUTES les instances de ces composants de page par le placeholder {children}
+    // On ne le remplace qu'une seule fois pour éviter d'avoir plusieurs {children}
+    let childrenInjected = false;
+    for (const pageName of pageComponentNames) {
+        const regex = new RegExp(`<${pageName}[\\s\\S]*?(?:\\/>|<\\/${pageName}>)`, 'g');
+        mainJsx = mainJsx.replace(regex, (match) => {
+            if (!childrenInjected) {
+                childrenInjected = true;
+                return '<main>{children}</main>'; // Remplacer la première page trouvée par {children}
+            }
+            return ''; // Supprimer les autres occurrences de pages
+        });
+    }
+    // Si aucune page n'a été trouvée, on supprime le bloc <Routes> s'il existe
+    if (!childrenInjected) {
+        mainJsx = mainJsx.replace(/<Routes>[\s\S]*?<\/Routes>/gs, '<main>{children}</main>');
+    }
+    
+    // --- ÉTAPE 4: NETTOYAGE DE LA LOGIQUE ET DES PROPS ORPHELINES ---
+    content = content.replace(/const\s*{\s*[\s\S]*?}\s*=\s*useAdvancedNavigation\(\);/gs, '');
+    content = content.replace(/const\s+(pageSEO|getPageSEO|prestation)\s*=\s*[\s\S]*?;/gs, '');
+    mainJsx = mainJsx.replace(/\s+(currentPage|onNavigateTo|onScrollToSection|onBack|prestation|pageSEO)={[^}]+}/g, '');
+    mainJsx = mainJsx.replace(/\s+\{\.{3}pageSEO\}/g, '');
+
+    // --- ÉTAPE 5: FILTRAGE FINAL DES IMPORTS ---
+    const usedComponents = new Set();
+    const jsxTags = mainJsx.match(/<([A-Z]\w*)/g) || [];
+    jsxTags.forEach(tag => usedComponents.add(tag.substring(1)));
+
+    const finalImports = allImports.filter(imp => {
+        if (/react-router-dom|\/pages\/|\/hooks\/|\/data\/|SEO\/MetaTags/.test(imp)) return false;
+        const importMatch = imp.match(/import\s+(?:type\s+)?(?:[\w\s,]*?{\s*([^}]+?)\s*})?/);
+        if (importMatch && importMatch[1]) {
+            const importedNames = importMatch[1].split(',').map(name => name.trim().split(' ')[0]);
+            return importedNames.some(name => usedComponents.has(name));
+        }
+        return true;
+    });
+
+    // --- ÉTAPE 6: RECONSTRUIRE LE FICHIER layout.tsx FINAL ---
+    const finalLayoutContent = `
 import type { Metadata } from "next";
-import { EnhancedNavigation } from "@/components/layout/EnhancedNavigation";
-import { ArtisticFooter } from "@/components/ArtisticFooter";
-import { FloatingCTA, ExitIntentPopup } from "@/components/ConversionElements";
-import "./index.css";
+${finalImports.join('\n')}
+import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Lis'Harmonie | Communication Animale & Bien-être",
-  description: "Découvrez la communication animale, le Shiatsu énergétique et les soins à distance avec Lisa Soler à Marseille.",
+  title: "My Converted Next App",
+  description: "Generated by React-to-Next converter",
 };
 
 export default function RootLayout({
@@ -243,18 +320,23 @@ export default function RootLayout({
   return (
     <html lang="fr">
       <body>
-        <div className="min-h-screen bg-gradient-to-br from-emerald-50 via-white to-teal-50 overflow-x-hidden">
-          <EnhancedNavigation />
-          <main className="pt-20">{children}</main>
-          <ArtisticFooter />
-          <FloatingCTA />
-          <ExitIntentPopup />
-        </div>
+        ${mainJsx}
       </body>
     </html>
   );
 }`;
-    await fs.writeFile(path.join(appPath, 'layout.tsx'), layoutContent.trim());
+
+    await fs.writeFile(layoutTsxPath, finalLayoutContent.trim());
+    console.log("-> 'layout.tsx' a été créé avec succès.");
+
+    // --- ÉTAPE 7: GESTION DU CSS ---
+    const globalsCssPath = path.join(appPath, 'globals.css');
+    const oldIndexCssPath = path.join(appPath, 'index.css');
+    if (await fileExists(oldIndexCssPath)) {
+        await fs.rename(oldIndexCssPath, globalsCssPath);
+    } else if (!await fileExists(globalsCssPath)) {
+        await fs.writeFile(globalsCssPath, '/* Styles globaux */');
+    }
 }
 
 async function createNextJsNavigation(componentsPath) {
